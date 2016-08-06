@@ -50,6 +50,7 @@ int nr_locks;
 int sleep_time = 5;
 int diffprio = 1;
 int nopi;
+int no_locks;
 int numprio;
 int can_migrate = 1;
 int cpus;
@@ -185,7 +186,7 @@ static void parse_options (int argc, char *argv[])
 			{"help", no_argument, NULL, '?'},
 			{NULL, 0, NULL, 0}
 		};
-		int c = getopt_long (argc, argv, "p:r:l:o:snmh",
+		int c = getopt_long (argc, argv, "p:r:l:o:snmhL",
 			long_options, &option_index);
 		if (c == -1)
 			break;
@@ -197,6 +198,7 @@ static void parse_options (int argc, char *argv[])
 		case 's': diffprio = 0; break;
 		case 'n': nopi = 1; break;
 		case 'm': can_migrate = 0; break;
+		case 'L': no_locks = 1; break;
 		case '?':
 		case 'h':
 			usage(argv);
@@ -274,7 +276,20 @@ static void print_results(void)
 	long total_migrate = 0;
 	long total_iterations = 0;
 	long total_loops = 0;
-	int i;
+	int i, j;
+	unsigned long sum, total_sum = 0;
+
+	printf("Lock     Wait time\n");
+	printf("----     ---------\n");
+	for (i = 0; i < nr_locks; i++) {
+		sum = 0;
+		for(j = 0; j < nr_runs; j++) {
+			sum += lock_wait_time[i][j];
+		}
+		total_sum += sum;
+		printf(" %3d     %lu\n", i, sum);
+	}
+	printf("        %lums\n", total_sum / (1000*1000));
 
 	printf("Task        vol    nonvol   migrated     iterations    loops\n"
 	       "----        ---    ------   --------     ----------    -----\n");
@@ -301,16 +316,18 @@ static int grab_lock(long id, int iter, int l)
 	unsigned long long delta;
 	int ret;
 
-	ftrace_write("thread %ld iter %d, taking lock %d\n",
-		     id, iter, l);
-	try_time = get_time();
-	pthread_mutex_lock(&locks[l]);
-	time = get_time();
-	delta = time - try_time;
-	if (iter < nr_runs)
-		lock_wait_time[l][iter] = time - try_time;
-	ftrace_write("thread %ld iter %d, took lock %d in %llu us\n",
-		     id, iter, delta / 1000);
+	if (!no_locks) {
+		ftrace_write("thread %ld iter %d, taking lock %d\n",
+				id, iter, l);
+		try_time = get_time();
+		pthread_mutex_lock(&locks[l]);
+		time = get_time();
+		delta = time - try_time;
+		if (iter < nr_runs)
+			lock_wait_time[l][iter] = time - try_time;
+		ftrace_write("thread %ld iter %d, took lock %d in %llu us\n",
+				id, iter, delta / 1000);
+	}
 
 	ret = busy_loop(nr_tasks - id, id);
 
