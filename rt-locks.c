@@ -50,12 +50,17 @@ int nr_locks;
 int sleep_time = 5;
 int diffprio = 1;
 int nopi;
+int highbounce;
+int high_nosleep;
+int high_cur_cpu;
+int high_extreme_bounce;
 int no_locks;
+int mem_busy_loop;
 int numprio;
 int can_migrate = 1;
 int cpus;
 
-static int read_ctx_switches(int pid, int *vol, int *nonvol, int *migrate);
+static int read_ctx_switches(int pid, int *vol, int *nonvol, int *migrate, double *waitsum);
 
 static int mark_fd = -1;
 static __thread char buff[BUFSIZ+1];
@@ -101,6 +106,7 @@ static void ftrace_write(const char *fmt, ...)
 #define nano2sec(nan) (nan / 1000000000ULL)
 #define nano2ms(nan) (nan / 1000000ULL)
 #define nano2usec(nan) (nan / 1000ULL)
+#define ms2sec(sec) (sec / 1000ULL)
 #define usec2nano(sec) (sec * 1000ULL)
 #define ms2nano(ms) (ms * 1000000ULL)
 #define sec2nano(sec) (sec * 1000000000ULL)
@@ -119,14 +125,16 @@ static unsigned long long end;
 static pthread_barrier_t start_barrier;
 static pthread_barrier_t end_barrier;
 static pthread_mutex_t *locks;
-static unsigned long long *lock_time;
-static unsigned long long **lock_wait_time;
+static unsigned long *task_lock_wait;
+static unsigned long *task_busy_time;
+static unsigned long *task_sleep_time;
 static int *iterations;
 static int *loops;
 
 static int *vol_switches;
 static int *nonvol_switches;
 static int *migrated;
+static double *task_waitsum;
 
 static long *thread_pids;
 
@@ -165,6 +173,12 @@ static void usage(char **argv)
 	       "-s    --same                Keep threads at same prio\n"
 	       "-n    --nopi                Do not use prio inheritance mutexes\n"
 	       "-m    --nomigrate           CPU/2 low prio tasks are pinned to CPU\n"
+               "-L                          Skip locking (makes grab_lock only busy loop\n"
+               "-M                          Perform cache intensive ops during busy loop\n"
+               "      --highbounce          Make highest priority task bounce around,\n"
+               "                            Also it will have 25pc sleep and 500pc busy time.\n"
+               "      --highxbounce   Force even more bounces inside busy loop\n"
+               "      --highnosleep         During high bouncing, make highest prio not sleep.\n"
 	       "  () above are defaults \n",
 		p);
 	exit(0);
@@ -181,12 +195,15 @@ static void parse_options (int argc, char *argv[])
 			{"locks", required_argument, NULL, 'l'},
 			{"same", no_argument, NULL, 's'},
 			{"nopi", no_argument, NULL, 'n'},
+			{"highbounce", no_argument, &highbounce, 1},
+			{"highxbounce", no_argument, &high_extreme_bounce, 1},
 			{"limitprio", no_argument, NULL, 'o'},
 			{"nomigrate", no_argument, NULL, 'm'},
 			{"help", no_argument, NULL, '?'},
+			{"highnosleep", no_argument, &high_nosleep, 1},
 			{NULL, 0, NULL, 0}
 		};
-		int c = getopt_long (argc, argv, "p:r:l:o:snmhL",
+		int c = getopt_long (argc, argv, "p:r:l:o:snmhLMH",
 			long_options, &option_index);
 		if (c == -1)
 			break;
@@ -199,13 +216,13 @@ static void parse_options (int argc, char *argv[])
 		case 'n': nopi = 1; break;
 		case 'm': can_migrate = 0; break;
 		case 'L': no_locks = 1; break;
+		case 'M': mem_busy_loop = 1; break;
 		case '?':
 		case 'h':
 			usage(argv);
 			break;
 		}
 	}
-
 }
 
 static unsigned long long get_time(void)
@@ -224,25 +241,40 @@ static unsigned long long get_time(void)
 static unsigned long busy_loop(int x, int id)
 {
 	unsigned long long start_time;
-	unsigned long long time;
+	unsigned long long time, prev_time;
 	unsigned long l = 0, i;
+	int  high = (id == nr_tasks - 1);
 	/*
 	 * 5KB buffer, 3 arrays, 4 bytes an array
 	 */
 	int nr_int = (5 * 1024) / (4 * 3);
-	int *tmem = threadmem[id];
+	int *tmem;
+
+	if (mem_busy_loop)
+		tmem = threadmem[id];
 
 	if (x <= 0)
 		return 0;
 
 	start_time = get_time();
 	do {
-		/* Number of times we were able to process arrays */
-		for (i = 0; i < nr_int; i++) {
-			tmem[i] = tmem[nr_int + i] + tmem[(2 * nr_int) + i];
+		if (high && high_extreme_bounce && !(l % 10)) {
+				cpu_set_t cpumask;
+				CPU_ZERO(&cpumask);
+				CPU_SET(((++high_cur_cpu) % cpus), &cpumask);
+				sched_setaffinity(0, sizeof(cpumask), &cpumask);
+		}
+
+		prev_time = get_time();
+		if (mem_busy_loop) {
+			/* Number of times we were able to process arrays */
+			for (i = 0; i < nr_int; i++) {
+				tmem[i] = tmem[nr_int + i] + tmem[(2 * nr_int) + i];
+			}
 		}
 		l++;
 		time = get_time();
+		task_busy_time[id] += (time - prev_time);
 	} while ((time - start_time) < RUN_INTERVAL * (x + 1));
 
 	return l;
@@ -277,36 +309,41 @@ static void print_results(void)
 	long total_iterations = 0;
 	long total_loops = 0;
 	int i, j;
-	unsigned long sum, total_sum = 0;
-
-	printf("Lock     Wait time\n");
-	printf("----     ---------\n");
-	for (i = 0; i < nr_locks; i++) {
-		sum = 0;
-		for(j = 0; j < nr_runs; j++) {
-			sum += lock_wait_time[i][j];
-		}
-		total_sum += sum;
-		printf(" %3d     %lu\n", i, sum);
-	}
-	printf("        %lums\n", total_sum / (1000*1000));
-
-	printf("Task        vol    nonvol   migrated     iterations    loops\n"
-	       "----        ---    ------   --------     ----------    -----\n");
+	unsigned long lwsum, lwtotal_sum = 0, busy_total = 0, sleep_total = 0, lock_wait_total = 0;
 
 	for (i = 0; i < nr_tasks; i++) {
-		printf("  %d:     %6d  %8d   %8d       %8d     %5d\n",
+		busy_total += task_busy_time[i];
+		sleep_total += task_sleep_time[i];
+		lock_wait_total += task_lock_wait[i];
+	}
+
+	printf("time                          :  %ds\n", sleep_time);
+	printf("lock_wait_total               :  %llums\n", nano2ms(lock_wait_total));
+	printf("lock_wait_total per task (avg):  %fms\n", nano2ms(lock_wait_total)/(1.0 * nr_tasks));
+	printf("busy time                     :  %llums\n", nano2ms(busy_total));
+	printf("busy time per task (avg)      :  %8fms\n", nano2ms(busy_total)/(1.0 * nr_tasks));
+	printf("sleep time                    :  %llums\n", nano2ms(sleep_total));
+	printf("sleep time per task (avg)     :  %8fms\n", nano2ms(sleep_total)/(1.0 * nr_tasks));
+
+	printf("Task        vol    nonvol   migrated     iterations    loops(K) mbusy(K/s)  lock-wait(ms)   busy(ms)  sleep(ms)   "
+               "Wait\n"
+	       "----        ---    ------   --------     ----------    -------- ----------  -------------   --------  ---------  "
+               "-----\n");
+
+	for (i = 0; i < nr_tasks; i++) {
+		printf(" %2d:     %6d  %8d   %8d     %10d    %8d      %6.2f  %13llu    %7llu %9llu  %5.3f\n",
 		       i, vol_switches[i], nonvol_switches[i],
-		       migrated[i], iterations[i], loops[i]);
+		       migrated[i], iterations[i], loops[i] / 1000, loops[i] / (nano2ms(task_busy_time[i]) * 1.0),
+		       nano2ms(task_lock_wait[i]), nano2ms(task_busy_time[i]), nano2ms(task_sleep_time[i]), task_waitsum[i]);
 		total_vol += vol_switches[i];
 		total_nonvol += nonvol_switches[i];
 		total_migrate += migrated[i];
 		total_iterations += iterations[i];
 		total_loops += loops[i];
 	}
-	printf("\ntotal:   %6ld   %8ld  %8ld       %8ld     %5ld\n",
+	printf("\ntotal:   %6ld   %8ld  %8ld       %8ld    %8ld\n",
 	       total_vol, total_nonvol, total_migrate,
-	       total_iterations, total_loops);
+	       total_iterations, total_loops/(1000*1000));
 }
 
 static int grab_lock(long id, int iter, int l)
@@ -315,6 +352,10 @@ static int grab_lock(long id, int iter, int l)
 	unsigned long long time;
 	unsigned long long delta;
 	int ret;
+	int high, busy_time;
+
+	if (id == nr_tasks - 1)
+		high = 1;
 
 	if (!no_locks) {
 		ftrace_write("thread %ld iter %d, taking lock %d\n",
@@ -323,14 +364,17 @@ static int grab_lock(long id, int iter, int l)
 		pthread_mutex_lock(&locks[l]);
 		time = get_time();
 		delta = time - try_time;
-		if (iter < nr_runs)
-			lock_wait_time[l][iter] = time - try_time;
 		ftrace_write("thread %ld iter %d, took lock %d in %llu us\n",
 				id, iter, delta / 1000);
+		task_lock_wait[id] += delta;
 	}
 
-	ret = busy_loop(nr_tasks - id, id);
+	if (high && (highbounce || high_nosleep))
+		busy_time = (nr_tasks / 2) - 1;
+	else
+		busy_time = nr_tasks - id;
 
+	ret = busy_loop(busy_time, id);
 	ftrace_write("thread %ld iter %d, unlock lock %d\n",
 		     id, iter, l);
 
@@ -342,13 +386,13 @@ static int grab_lock(long id, int iter, int l)
 void *start_task(void *data)
 {
 	long id = (long)data;
-	unsigned long long start_time;
+	unsigned long long start_time, sleep_start;
 	struct sched_param param = {
 		.sched_priority = id * diffprio + prio_start,
 	};
 	int ret;
 	long pid;
-	int i, l, lp;
+	int i, l, lp, sleep_time, high = (id == nr_tasks - 1);
 
 	pid = gettid();
 
@@ -360,7 +404,7 @@ void *start_task(void *data)
 	}
 
 	/* some processes may need to be pinned */
-	if (!can_migrate && id < cpus) {
+	if (!can_migrate && id <= cpus) {
 		cpu_set_t cpumask;
 		int cpu;
 
@@ -373,11 +417,14 @@ void *start_task(void *data)
 		else
 			cpu = id - 1;
 
-		if (cpu >= cpus/2)
+		/* pin only first nr_tasks/4 tasks */
+		if (cpu >= nr_tasks/4)
 			goto skip;
 
+		printf("Pinning task %ld to CPU %d\n", id, cpu);
+
 		CPU_ZERO(&cpumask);
-		CPU_SET(id, &cpumask);
+		CPU_SET(cpu, &cpumask);
 		/* bind to CPU */
 		sched_setaffinity(0, sizeof(cpumask), &cpumask);
 	}
@@ -394,7 +441,33 @@ void *start_task(void *data)
 			lp += grab_lock(id, i, l);
 			ftrace_write("thread %ld iter %d sleeping\n",
 				     id, i);
-			ms_sleep(id);
+			if (high) {
+				if (high_nosleep) {
+					sleep_time = 0;
+				} else if (highbounce) {
+					// Default to a small sleep time when high bouncing
+					sleep_time = (nr_tasks / 4);
+				}
+				else
+					sleep_time = id;
+			} else {
+				sleep_time = id;
+			}
+
+			// Sleep for atleast 1ms to prevent rt throttle
+			if (!sleep_time)
+				sleep_time = 1;
+
+			sleep_start = get_time();
+			ms_sleep(sleep_time);
+			task_sleep_time[id] += get_time() - sleep_start;
+
+			if (high && highbounce) {
+				cpu_set_t cpumask;
+				CPU_ZERO(&cpumask);
+				CPU_SET(((++high_cur_cpu) % cpus), &cpumask);
+				sched_setaffinity(0, sizeof(cpumask), &cpumask);
+			}
 		}
 		i++;
 	}
@@ -402,7 +475,7 @@ void *start_task(void *data)
 	loops[id] = lp;
 	iterations[id] = i;
 	read_ctx_switches(gettid(), &vol_switches[id], &nonvol_switches[id],
-			  &migrated[id]);
+			  &migrated[id], &task_waitsum[id]);
 
 	pthread_barrier_wait(&end_barrier);
 
@@ -442,12 +515,43 @@ static int update_value(const char *line, int *val, const char *name)
 	return 0;
 }
 
-static int read_ctx_switches(int pid, int *vol, int *nonvol, int *migrate)
+static double get_float_value(const char *line)
+{
+	const char *p;
+
+	for (p = line; isspace(*p); p++)
+		;
+	if (*p != ':')
+		return -1;
+	p++;
+	for (; isspace(*p); p++)
+		;
+	return atof(p);
+}
+
+static int update_float_value(const char *line, double *val, const char *name)
+{
+	int ret;
+	double v;
+
+	if (strncmp(line, name, strlen(name)) == 0) {
+		v = get_float_value(line + strlen(name));
+		if (v < 0)
+			return 0;
+		*val = v;
+		return 1;
+	}
+	return 0;
+}
+
+
+static int read_ctx_switches(int pid, int *vol, int *nonvol, int *migrate, double *waitsum)
 {
 	static int vol_once, nonvol_once;
 	const char *vol_name = "nr_voluntary_switches";
 	const char *nonvol_name = "nr_involuntary_switches";
 	const char *migrate_name = "se.nr_migrations";
+	const char *waitsum_name = "se.statistics.wait_sum";
 	char file[1024];
 	char buf[1024];
 	char *pbuf;
@@ -468,6 +572,7 @@ static int read_ctx_switches(int pid, int *vol, int *nonvol, int *migrate)
 	}
 
 	*vol = *nonvol = *migrate = -1;
+	*waitsum = -1;
 
 	n = 1024;
 	pn = &n;
@@ -482,6 +587,9 @@ static int read_ctx_switches(int pid, int *vol, int *nonvol, int *migrate)
 			continue;
 
 		if (update_value(buf, migrate, migrate_name))
+			continue;
+
+		if (update_float_value(buf, waitsum, waitsum_name))
 			continue;
 	}
 	fclose(fp);
@@ -568,20 +676,16 @@ int main (int argc, char **argv)
 			perr("pthread_mutex_init");
 	}
 
-	lock_time = do_malloc(lock_time, nr_locks);
-
-	lock_wait_time = do_malloc(lock_wait_time, nr_locks);
-	for (i = 0; i < nr_locks; i++) {
-		lock_wait_time[i] = malloc(sizeof(**lock_wait_time) * nr_runs);
-		if (!lock_wait_time[i])
-			perr("malloc");
-		memset(lock_wait_time[i], 0, sizeof(**lock_wait_time) * nr_runs);
-	}
-
 	vol_switches = do_malloc(vol_switches, nr_tasks);
 	nonvol_switches = do_malloc(nonvol_switches, nr_tasks);
+	task_waitsum = do_malloc(task_waitsum, nr_tasks);
 	migrated = do_malloc(migrated, nr_tasks);
-	threadmem = do_malloc(threadmem, nr_tasks);
+	task_lock_wait = do_malloc(task_lock_wait, nr_tasks);
+	task_busy_time = do_malloc(task_busy_time, nr_tasks);
+	task_sleep_time = do_malloc(task_sleep_time, nr_tasks);
+
+	if (mem_busy_loop)
+		threadmem = do_malloc(threadmem, nr_tasks);
 
 	ret = pthread_barrier_init(&start_barrier, NULL, nr_tasks + 1);
 	if (ret < 0)
@@ -599,13 +703,15 @@ int main (int argc, char **argv)
 		if (pthread_create(&threads[i], NULL, start_task, (void *)i))
 			perr("pthread_create");
 
-		/*
-		 * 8 tasks, 2 tasks per CPU, 32KB per l1-cache, 16 kb per task,
-		 * each task has 3 buffers ~5.33kb, Assume 5kb. 
-		 */
-		threadmem[i] = aligned_alloc(4096, 1024 * 5);
-		if (!threadmem[i]) {
-			perr("threadmem %d alloc error\n", i);
+		if (mem_busy_loop) {
+			/*
+			 * 8 tasks, 2 tasks per CPU, 32KB per l1-cache, 16 kb per task,
+			 * each task has 3 buffers ~5.33kb, Assume 5kb. x512/4 for stride
+			 */
+			threadmem[i] = aligned_alloc(4096, 5 * 1024);
+			if (!threadmem[i]) {
+				perr("threadmem %d alloc error\n", i);
+			}
 		}
 	}
 
@@ -632,7 +738,8 @@ int main (int argc, char **argv)
 
 	for (i=0; i < nr_tasks; i++) {
 		pthread_join(threads[i], (void*)&thread_pids[i]);
-		free(threadmem[i]);
+		if (mem_busy_loop)
+			free(threadmem[i]);
 	}
 
 	print_results();
